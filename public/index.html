@@ -1,0 +1,1059 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZecX-Hpot Dashboard</title>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+        <!-- Tailwind config (before CDN) -->
+        <script>
+            window.tailwind = window.tailwind || {}
+            tailwind.config = {
+                darkMode: 'class',
+                theme: {
+                    extend: {
+                        colors: {
+                            brand: {
+                                50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe', 300: '#93c5fd', 400: '#60a5fa', 500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 800: '#1e40af', 900: '#1e3a8a'
+                            }
+                        },
+                        boxShadow: {
+                            card: '0 6px 30px rgba(2, 6, 23, 0.08)'
+                        },
+                        borderRadius: {
+                            xl: '0.9rem'
+                        }
+                    }
+                }
+            }
+        </script>
+        <script src="./config.js" defer></script>
+        <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.0/firebase-app.js'
+    import { getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut as fbSignOut } from 'https://www.gstatic.com/firebasejs/10.14.0/firebase-auth.js'
+    import { getFirestore, collection, query, where, getDocs, onSnapshot, doc, updateDoc, Timestamp, orderBy } from 'https://www.gstatic.com/firebasejs/10.14.0/firebase-firestore.js'
+
+            const LS_THEME_KEY = 'zecx_theme'
+            function applyTheme(fromStorage=true){
+                try {
+                    const root = document.documentElement
+                    let mode = fromStorage ? localStorage.getItem(LS_THEME_KEY) : null
+                    if (!mode) {
+                        mode = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+                    }
+                    if (mode === 'dark') root.classList.add('dark'); else root.classList.remove('dark')
+                    const t = document.getElementById('themeToggle')
+                    if (t) t.textContent = (root.classList.contains('dark') ? '☀️ Light' : '🌙 Dark')
+                } catch {}
+            }
+            applyTheme()
+
+            const LS_CFG_KEY = 'zecx_firebase_config'
+            function getConfig() {
+                // Prefer injected window.firebaseConfig from config.js
+                if (window.firebaseConfig && window.firebaseConfig.projectId) return window.firebaseConfig
+                const s = localStorage.getItem(LS_CFG_KEY)
+                if (s) { try { const c = JSON.parse(s); if (c.projectId) return c } catch(_){} }
+                return null
+            }
+
+            function askForConfig() {
+                const form = document.getElementById('cfgForm')
+                form.classList.remove('hidden')
+                document.getElementById('saveCfg').onclick = () => {
+                    try {
+                        const txt = (document.getElementById('cfgInput').value||'').trim()
+                        const cfg = JSON.parse(txt)
+                        if (!cfg.projectId) throw new Error('Missing projectId')
+                        localStorage.setItem(LS_CFG_KEY, JSON.stringify(cfg))
+                        location.reload()
+                    } catch (e) {
+                        alert('Invalid config JSON: ' + e.message)
+                    }
+                }
+            }
+
+            const firebaseConfig = getConfig()
+            if (!firebaseConfig) { askForConfig(); throw new Error('Firebase config required'); }
+
+    const app = initializeApp(firebaseConfig)
+    const auth = getAuth(app)
+    const db = getFirestore(app)
+
+    const $ = s => document.querySelector(s)
+    const LS_KEY = 'zecx_agent_uuid'
+
+    const state = { agentId: localStorage.getItem(LS_KEY) || null, user: null }
+    state.terminal = { lines: [], filterIp: '', autoscroll: true, max: 500 }
+    state.services = []
+    state.dirty = false
+
+    function setDirty(v=true){
+        state.dirty = !!v
+        const applyBtn = document.getElementById('applySettingsBtn')
+        const svcSave = document.getElementById('svcSaveBtn')
+        ;[applyBtn, svcSave].forEach(btn => { if (!btn) return; btn.disabled = !state.dirty; btn.textContent = state.dirty ? 'Save' : 'Saved' })
+    }
+
+        function showPairing() {
+            $('#pairing').classList.remove('hidden')
+            $('#dashboard').classList.add('hidden')
+        }
+        function showDash() {
+            $('#pairing').classList.add('hidden')
+            $('#dashboard').classList.remove('hidden')
+        }
+
+        async function pair(code) {
+            try {
+                if (!auth.currentUser) {
+                    alert('Please sign in to pair this agent to your account.')
+                    document.getElementById('openAuthBtn')?.focus()
+                    return
+                }
+                const q = query(collection(db, 'honeypots'), where('pairingCode', '==', code))
+                const snap = await getDocs(q)
+                if (snap.empty) { alert('Code not found'); return }
+                const d = snap.docs[0]
+                state.agentId = d.id
+                localStorage.setItem(LS_KEY, d.id)
+                const user = auth.currentUser
+                await updateDoc(doc(db, 'honeypots', d.id), {
+                    pairingCode: null,
+                    isPaired: true,
+                    ownerUid: user.uid
+                })
+                initDashboard()
+            } catch (e) {
+                console.error('Pairing failed:', e)
+                alert('Pairing failed: ' + (e?.message || e))
+            }
+        }
+
+        async function generateReport() {
+            if (!state.agentId) { alert('Link an agent first.'); return }
+            const fromEl = document.getElementById('reportFrom')
+            const toEl = document.getElementById('reportTo')
+            const sevEl = document.getElementById('reportSeverity')
+            const from = fromEl?.value ? new Date(fromEl.value) : null
+            const to = toEl?.value ? new Date(toEl.value) : null
+            const sev = (sevEl?.value || 'Any')
+            try {
+                const eventsCol = collection(db, 'honeypots', state.agentId, 'events')
+                let qy = query(eventsCol)
+                if (from) qy = query(qy, where('timestamp', '>=', Timestamp.fromDate(from)))
+                if (to) qy = query(qy, where('timestamp', '<=', Timestamp.fromDate(to)))
+                qy = query(qy, orderBy('timestamp', 'desc'))
+                const snap = await getDocs(qy)
+                const rows = []
+                snap.forEach(docu => {
+                    const e = docu.data()
+                    if (sev !== 'Any' && (e.severity||'').toLowerCase() !== sev.toLowerCase()) return
+                    rows.push({
+                        ts: e.timestamp?.seconds ? new Date(e.timestamp.seconds*1000) : new Date(),
+                        type: e.type || '-',
+                        ip: e.attackerIp || '-',
+                        port: e.targetPort || '',
+                        severity: e.severity || 'Low'
+                    })
+                })
+                const bySev = rows.reduce((acc, r)=>{ acc[r.severity] = (acc[r.severity]||0)+1; return acc }, {})
+                const byPort = rows.reduce((acc,r)=>{ const k = String(r.port||''); acc[k]=(acc[k]||0)+1; return acc }, {})
+                const byIp = rows.reduce((acc,r)=>{ const k = r.ip; acc[k]=(acc[k]||0)+1; return acc }, {})
+                function topN(obj, n=5){ return Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n) }
+                const summ = document.getElementById('reportSummary')
+                if (summ) {
+                    const total = rows.length
+                    const sevTxt = Object.entries(bySev).map(([k,v])=>`${k}: ${v}`).join(' • ') || '—'
+                    const topPorts = topN(byPort).map(([k,v])=> (k||'—')+` (${v})`).join(', ') || '—'
+                    const topIps = topN(byIp).map(([k,v])=> `${k} (${v})`).join(', ') || '—'
+                    summ.innerHTML = `
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div class="p-3 rounded-lg bg-white/60 dark:bg-white/10 border border-white/20"><div class="text-xs text-slate-500">Total Events</div><div class="text-2xl font-semibold">${total}</div></div>
+                            <div class="p-3 rounded-lg bg-white/60 dark:bg-white/10 border border-white/20"><div class="text-xs text-slate-500">By Severity</div><div class="text-sm">${sevTxt}</div></div>
+                            <div class="p-3 rounded-lg bg-white/60 dark:bg-white/10 border border-white/20"><div class="text-xs text-slate-500">Top Ports</div><div class="text-sm">${topPorts}</div></div>
+                        </div>
+                        <div class="mt-2 text-xs text-slate-500">Top IPs: ${topIps}</div>`
+                }
+                const tbody = document.getElementById('reportTable')
+                if (tbody) {
+                    tbody.innerHTML = ''
+                    rows.forEach(r => {
+                        const tr = document.createElement('tr')
+                        tr.className = 'border-b border-white/20'
+                        tr.innerHTML = `<td class="px-2 py-1">${r.ts.toLocaleString()}</td>
+                                        <td class="px-2 py-1">${r.type}</td>
+                                        <td class="px-2 py-1">${r.ip}</td>
+                                        <td class="px-2 py-1">${r.port||''}</td>
+                                        <td class="px-2 py-1">${r.severity}</td>`
+                        tbody.appendChild(tr)
+                    })
+                }
+                state.lastReport = { rows }
+            } catch (e) {
+                console.error('Report generation failed', e)
+                alert('Failed to generate report: ' + (e?.message || e))
+            }
+        }
+
+        function downloadReportPDF() {
+            try {
+                const { jsPDF } = window.jspdf || {}
+                if (!jsPDF) { alert('PDF library not loaded'); return }
+                const docp = new jsPDF({ unit: 'pt', format: 'a4' })
+                const margin = 40
+                let y = margin
+                docp.setFont('helvetica','bold'); docp.setFontSize(16)
+                docp.text('ZecX-Hpot Report', margin, y); y += 22
+                docp.setFont('helvetica','normal'); docp.setFontSize(10)
+                const now = new Date().toLocaleString()
+                docp.text(`Generated: ${now}`, margin, y); y += 16
+                const user = auth.currentUser
+                if (user?.email) { docp.text(`Owner: ${user.email}`, margin, y); y += 16 }
+                const sumEl = document.getElementById('reportSummary')
+                if (sumEl) {
+                    const tmp = sumEl.cloneNode(true)
+                    const txt = tmp.innerText.replace(/\n+/g,' • ')
+                    const lines = docp.splitTextToSize(txt, 515)
+                    docp.text(lines, margin, y); y += (lines.length*14 + 10)
+                }
+                docp.setFont('helvetica','bold'); docp.text('Events', margin, y); y += 16
+                docp.setFont('helvetica','normal')
+                const rows = (state.lastReport?.rows || []).slice(0, 50)
+                docp.setFontSize(9)
+                const cols = ['Time','Type','IP','Port','Severity']
+                const colW = [150, 110, 120, 50, 85]
+                let x = margin
+                cols.forEach((c,i)=>{ docp.text(c, x, y); x += colW[i] })
+                y += 12
+                rows.forEach(r => {
+                    x = margin
+                    const vals = [r.ts.toLocaleString(), r.type, r.ip, String(r.port||''), r.severity]
+                    vals.forEach((v,i)=>{ const line = docp.splitTextToSize(v, colW[i]-6); docp.text(line, x, y); x += colW[i] })
+                    y += 12
+                    if (y > 780) { docp.addPage(); y = margin }
+                })
+                const fname = `zecx-report-${Date.now()}.pdf`
+                docp.save(fname)
+            } catch (e) {
+                console.error('PDF export failed', e)
+                alert('PDF export failed: ' + (e?.message || e))
+            }
+        }
+
+    function initDashboard() {
+            showDash()
+            const agentDoc = doc(db, 'honeypots', state.agentId)
+            if (window.__zecx_unsubDoc) { try { window.__zecx_unsubDoc() } catch(_){} }
+            window.__zecx_unsubDoc = onSnapshot(agentDoc, (snap) => {
+                const data = snap.data() || {}
+                $('#hostname').textContent = data.systemInfo?.hostname || '-'
+                $('#ip').textContent = data.systemInfo?.ipAddress || '-'
+                $('#mac').textContent = data.systemInfo?.macAddress || '-'
+                $('#os').textContent = data.systemInfo?.os || '-'
+                $('#publicIp').textContent = data.systemInfo?.publicIp || '-'
+
+                // Settings -> reflect in UI
+                const s = data.settings || {}
+                const sshEnabled = (s.enableSSH !== false)
+                const httpEnabled = (s.enableHTTP !== false)
+                const sshPort = s.sshPort || 22
+                const httpPort = s.httpPort || 80
+                const sshToggle = document.getElementById('sshToggle')
+                const httpToggle = document.getElementById('httpToggle')
+                const sshPortInput = document.getElementById('sshPort')
+                const httpPortInput = document.getElementById('httpPort')
+                if (sshToggle) sshToggle.checked = !!sshEnabled
+                if (httpToggle) httpToggle.checked = !!httpEnabled
+                if (sshPortInput) sshPortInput.value = sshPort
+                if (httpPortInput) httpPortInput.value = httpPort
+                setDirty(false)
+                // Render services presets
+                state.services = toPresetList(Array.isArray(s.services) ? s.services : [])
+                renderServices()
+
+                // Status badges
+                const st = data.status || {}
+                renderStatus(st)
+
+                // If we have a public IP, optionally plot honeypot location on the map
+                const pip = data.systemInfo?.publicIp
+                if (pip && window.__zecx_map) {
+                    // Fetch geolocation lightweight
+                    const ctrl = new AbortController()
+                    setTimeout(() => ctrl.abort(), 2500)
+                    fetch('https://ipwho.is/' + encodeURIComponent(pip), { signal: ctrl.signal })
+                        .then(r => r.ok ? r.json() : null)
+                        .then(j => {
+                            if (!j || j.success === false || typeof j.latitude !== 'number' || typeof j.longitude !== 'number') return
+                            try { if (window.__zecx_homeMarker) { window.__zecx_map.removeLayer(window.__zecx_homeMarker) } } catch(_){}
+                            const m = L.marker([j.latitude, j.longitude]).addTo(window.__zecx_map)
+                            m.bindPopup(`<b>Honeypot</b><br>${pip}<br>${(j.city||'')}, ${(j.country||'')}`)
+                            window.__zecx_homeMarker = m
+                        }).catch(()=>{})
+                }
+            })
+
+            // Live events feed
+            const eventsCol = collection(db, 'honeypots', state.agentId, 'events')
+            state.feed = state.feed || { paused: false, maxItems: 200 }
+            if (window.__zecx_unsubEventsFeed) { try { window.__zecx_unsubEventsFeed() } catch(_){} }
+                        window.__zecx_unsubEventsFeed = onSnapshot(eventsCol, (snap) => {
+                const feed = $('#feed')
+                const aList = document.getElementById('attackerList')
+                snap.docChanges().forEach(c => {
+                    if (c.type !== 'added') return
+                    const e = c.doc.data()
+                    // Render attack feed item (skip when paused)
+                    if (!state.feed.paused && feed) {
+                                                const li = document.createElement('li')
+                                                li.className = 'grid grid-cols-12 items-center px-1 py-1 text-sm hover:bg-white/70 dark:hover:bg-white/10 transition-colors'
+                                                const sev = (e.severity||'Low')
+                                                const sevCls = {
+                                                    Low: 'text-slate-600 border-slate-300 bg-slate-100/50 dark:text-slate-300 dark:border-slate-600 dark:bg-slate-800/40',
+                                                    Medium: 'text-amber-700 border-amber-300 bg-amber-50/60 dark:text-amber-200 dark:border-amber-600 dark:bg-amber-900/20',
+                                                    High: 'text-orange-700 border-orange-300 bg-orange-50/60 dark:text-orange-200 dark:border-orange-600 dark:bg-orange-900/20',
+                                                    Critical: 'text-red-700 border-red-300 bg-red-50/60 dark:text-red-200 dark:border-red-600 dark:bg-red-900/20'
+                                                }[sev] || 'text-slate-600 border-slate-300 bg-slate-100/50 dark:text-slate-300 dark:border-slate-600 dark:bg-slate-800/40'
+                                                const when = new Date(e.timestamp?.seconds*1000||Date.now()).toLocaleString()
+                                                const ip = e.attackerIp||'unknown'
+                                                const port = e.targetPort||''
+                                                const type = e.type || 'EVENT'
+                                                li.innerHTML = `
+                                                    <div class="col-span-2 text-xs text-slate-500 dark:text-slate-400">${when}</div>
+                                                    <div class="col-span-4 truncate" title="${type}">${type}</div>
+                                                    <div class="col-span-3 font-mono">
+                                                        <button class="attacker-ip text-blue-700 dark:text-blue-300 underline decoration-dotted" data-ip="${ip}">${ip}</button>
+                                                    </div>
+                                                    <div class="col-span-1 font-mono text-slate-700 dark:text-slate-300">${port||''}</div>
+                                                    <div class="col-span-2 flex justify-end">
+                                                        <span class="inline-flex items-center px-2 py-0.5 rounded-full border text-xs ${sevCls}">${sev}</span>
+                                                    </div>`
+                        feed.prepend(li)
+                        // cap items
+                        while (feed.children.length > state.feed.maxItems) feed.removeChild(feed.lastChild)
+                        li.querySelectorAll('.attacker-ip').forEach(btn => btn.addEventListener('click', () => showProfile(btn.dataset.ip)))
+                    }
+
+                    // Attackers list brief
+                    if (aList) {
+                        const ali = document.createElement('li')
+                        ali.className = 'p-2 border-b text-sm'
+                        ali.textContent = `${e.attackerIp||'unknown'} • ${e.type} • Port ${e.targetPort||''} • ${new Date(e.timestamp?.seconds*1000||Date.now()).toLocaleString()}`
+                        aList.prepend(ali)
+                    }
+
+                    // Terminal panel lines
+                    if (e.type === 'SSH_COMMAND' || e.type === 'SERVICE_COMMAND') {
+                        const ts = new Date(e.timestamp?.seconds*1000||Date.now()).toLocaleTimeString()
+                        const ip = e.attackerIp || 'unknown'
+                        const port = e.targetPort || ''
+                        const payload = e.payload || {}
+                        const msg = (payload.command || payload.Command || payload.line || payload.Line || payload.data || payload.Data || '')
+                        const kind = (payload.kind || e.kind || payload.service || '')
+                        const cmd = kind ? `[${kind}] ${msg}` : msg
+                        state.terminal.lines.push({ ts, ip, cmd, port })
+                        if (state.terminal.lines.length > state.terminal.max) {
+                            state.terminal.lines.splice(0, state.terminal.lines.length - state.terminal.max)
+                        }
+                        renderTerminal()
+                    }
+                })
+            })
+
+            // Traffic chart (modern styling)
+            const ctx = document.getElementById('trafficChart')
+            const nf = new Intl.NumberFormat()
+            function niceStep(max, desired=6) {
+                const range = Math.max(1, Number(max) || 1)
+                const raw = range / Math.max(2, desired)
+                const pow = Math.pow(10, Math.floor(Math.log10(raw)))
+                const base = raw / pow
+                let factor = 1
+                if (base <= 1) factor = 1
+                else if (base <= 2) factor = 2
+                else if (base <= 5) factor = 5
+                else factor = 10
+                return factor * pow
+            }
+            function niceCeil(max, step) {
+                step = step || niceStep(max)
+                return Math.ceil((Number(max)||0) / step) * step
+            }
+            const chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        { label: 'Bytes In', data: [], borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.15)', borderWidth: 2, tension: 0.35, pointRadius: 0 },
+                        { label: 'Bytes Out', data: [], borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,0.15)', borderWidth: 2, tension: 0.35, pointRadius: 0 }
+                    ]
+                },
+                options: {
+                    animation: false,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: true, position: 'top' } },
+                    scales: {
+                        x: { grid: { color: 'rgba(148,163,184,0.2)' } },
+                        y: { beginAtZero: true, min: 0, grid: { color: 'rgba(148,163,184,0.2)' }, ticks: { autoSkip: false, font: { size: 10 }, callback: (v)=> nf.format(v), maxTicksLimit: 7 } }
+                    }
+                }
+            })
+            const trafficCol = collection(db, 'honeypots', state.agentId, 'traffic')
+            if (window.__zecx_unsubTraffic) { try { window.__zecx_unsubTraffic() } catch(_){} }
+            window.__zecx_unsubTraffic = onSnapshot(trafficCol, (snap) => {
+                snap.docChanges().forEach(c => {
+                    const t = c.doc.data()
+                    const ts = new Date(t.timestamp?.seconds*1000||Date.now()).toLocaleTimeString()
+                    chart.data.labels.push(ts)
+                    chart.data.datasets[0].data.push(t.bytesIn||0)
+                    chart.data.datasets[1].data.push(t.bytesOut||0)
+                })
+                // Dynamically compute a nice y-axis step and max
+                const maxIn = Math.max(0, ...chart.data.datasets[0].data)
+                const maxOut = Math.max(0, ...chart.data.datasets[1].data)
+                const maxVal = Math.max(maxIn, maxOut)
+                const step = niceStep(maxVal, 6)
+                const y = chart.options.scales.y
+                y.min = 0
+                y.ticks.stepSize = step
+                y.ticks.autoSkip = false
+                y.max = Math.max(step * 2, niceCeil(maxVal, step))
+                chart.update('none')
+            })
+
+            // Map
+            const map = L.map('map').setView([20, 0], 2)
+            window.__zecx_map = map
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM' }).addTo(map)
+            // If the container was hidden at init, ensure proper sizing shortly after
+            setTimeout(() => { try { map.invalidateSize() } catch(_){} }, 120)
+            if (window.__zecx_unsubEventsMap) { try { window.__zecx_unsubEventsMap() } catch(_){} }
+            window.__zecx_unsubEventsMap = onSnapshot(eventsCol, (snap) => {
+                snap.docChanges().forEach(c => {
+                    const e = c.doc.data()
+                    const g = e.geolocation
+                    if (g && typeof g.lat === 'number' && typeof g.lon === 'number') {
+                        const m = L.marker([g.lat, g.lon]).addTo(map)
+                        m.bindPopup(`<b>${e.attackerIp||''}</b><br>${e.type}<br>Port ${e.targetPort||''}`)
+                        try { map.invalidateSize() } catch(_){}
+                    }
+                })
+            })
+
+            // Update header actions visibility/info
+            try {
+                const idSpan = document.getElementById('linkedAgentUuid')
+                if (idSpan) idSpan.textContent = state.agentId || ''
+                document.getElementById('linkedAgentInfo')?.classList.remove('hidden')
+                document.getElementById('disconnectAgentBtn')?.classList.remove('hidden')
+                document.getElementById('signOutBtn')?.classList.remove('hidden')
+            } catch(_){}
+        }
+
+        async function applySettings() {
+            const agentDoc = doc(db, 'honeypots', state.agentId)
+            const sshEnabled = !!document.getElementById('sshToggle').checked
+            const httpEnabled = !!document.getElementById('httpToggle').checked
+            let sshPort = parseInt(document.getElementById('sshPort').value, 10)
+            let httpPort = parseInt(document.getElementById('httpPort').value, 10)
+            function validPort(p){ return Number.isInteger(p) && p >= 1 && p <= 65535 }
+            if (!validPort(sshPort) || !validPort(httpPort)) {
+                alert('Ports must be integers between 1 and 65535')
+                return
+            }
+            try {
+                // Build services from presets
+                const svcs = fromPresetList(state.services)
+                // Keep local presets; just re-render (status will reflect after agent applies)
+                renderServices()
+                // Write the full settings map (required by our security rules)
+                await updateDoc(agentDoc, {
+                    settings: { enableSSH: sshEnabled, enableHTTP: httpEnabled, sshPort, httpPort, services: svcs }
+                })
+                setDirty(false)
+            } catch (e) {
+                console.error('Settings update failed', e)
+                alert('Failed to update settings: ' + (e?.message || e))
+            }
+        }
+
+        function toPresetList(services) {
+            // Map arbitrary services into a stable preset list with toggles
+            const presets = [
+                {kind:'telnet', label:'Telnet', port:23, banner:'', enabled:false},
+                {kind:'ftp', label:'FTP', port:21, banner:'220 (vsFTPd 3.0.3)\r\n', enabled:false},
+                {kind:'smtp', label:'SMTP', port:25, banner:'220 mail ESMTP Postfix\r\n', enabled:false},
+                {kind:'redis', label:'Redis', port:6379, banner:'', enabled:false},
+                {kind:'mysql', label:'MySQL', port:3306, banner:'\x05\x00\x00\x0a5.7.42\x00', enabled:false},
+                {kind:'memcached', label:'Memcached', port:11211, banner:'', enabled:false},
+                {kind:'mqtt', label:'MQTT', port:1883, banner:'', enabled:false},
+                {kind:'vnc', label:'VNC', port:5900, banner:'RFB 003.008\n', enabled:false},
+                {kind:'rdp', label:'RDP', port:3389, banner:'', enabled:false}
+            ]
+            // overlay incoming config
+            services.forEach(s => {
+                const i = presets.findIndex(p => p.kind===s.kind)
+                if (i>=0) { presets[i] = {...presets[i], enabled: !!s.enabled, port: s.port||presets[i].port, banner: s.banner||presets[i].banner} }
+            })
+            return presets
+        }
+
+        function fromPresetList(list) {
+            return (list||[]).filter(p=>p.enabled).map(p=>({name:p.label||p.kind, kind:p.kind, port:p.port, enabled:true, banner:p.banner||''}))
+        }
+
+        function renderStatus(st) {
+            try {
+                const ssh = st.ssh || {}
+                const http = st.http || {}
+                const sshBadge = document.getElementById('sshStatusBadge')
+                const httpBadge = document.getElementById('httpStatusBadge')
+                if (sshBadge) sshBadge.textContent = ssh.listening ? `SSH up :${ssh.port||''}` : (ssh.enabled ? `SSH error` : `SSH off`)
+                if (httpBadge) httpBadge.textContent = http.listening ? `HTTP up :${http.port||''}` : (http.enabled ? `HTTP error` : `HTTP off`)
+                const svcWrap = document.getElementById('svcStatusList')
+                if (svcWrap) {
+                    svcWrap.innerHTML = ''
+                    const arr = Array.isArray(st.services)? st.services : []
+                    arr.forEach(sv => {
+                        const li = document.createElement('div')
+                        li.className = 'text-xs'
+                        const label = `${sv.kind}:${sv.port}`
+                        const txt = sv.listening ? `${label} up` : (sv.enabled ? `${label} error` : `${label} off`)
+                        li.textContent = txt
+                        svcWrap.appendChild(li)
+                    })
+                }
+            } catch {}
+        }
+
+        function renderServices() {
+            const wrap = document.getElementById('servicesList')
+            if (!wrap) return
+            wrap.innerHTML = ''
+            const makeRow = (p, idx) => {
+                const row = document.createElement('div')
+                row.className = 'grid grid-cols-12 items-center gap-2 py-1 border-b border-slate-100 dark:border-slate-800'
+                row.innerHTML = `
+                    <div class="col-span-2 font-medium">${p.label}</div>
+                    <div class="col-span-2 text-xs text-slate-500">${p.kind.toUpperCase()}</div>
+                    <div class="col-span-2"><input type="number" min="1" max="65535" class="svc-port w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" value="${p.port}"/></div>
+                    <div class="col-span-5"><input class="svc-banner w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" placeholder="Banner (optional)" value="${p.banner||''}"/></div>
+                    <div class="col-span-1 flex items-center justify-center">
+                        <input type="checkbox" title="Enabled" class="svc-enabled accent-blue-600" ${p.enabled?'checked':''} />
+                    </div>
+                `
+                row.querySelector('.svc-port').addEventListener('input', e=>{ state.services[idx].port = parseInt(e.target.value,10)||p.port; setDirty(true) })
+                row.querySelector('.svc-banner').addEventListener('input', e=>{ state.services[idx].banner = e.target.value; setDirty(true) })
+                row.querySelector('.svc-enabled').addEventListener('change', e=>{ state.services[idx].enabled = !!e.target.checked; setDirty(true) })
+                return row
+            }
+            state.services.forEach((p, idx) => wrap.appendChild(makeRow(p, idx)))
+            const addBtn = document.getElementById('svcAddBtn')
+            if (addBtn) addBtn.onclick = () => {
+                // Toggle some common ones quickly
+                state.services = toPresetList([])
+                state.services.forEach((p,i)=>{ if (['telnet','ftp','smtp','redis'].includes(p.kind)) state.services[i].enabled = true })
+                renderServices()
+                setDirty(true)
+            }
+            const saveBtn = document.getElementById('svcSaveBtn')
+            if (saveBtn) saveBtn.onclick = applySettings
+        }
+
+        async function showProfile(ip) {
+            if (!ip) return
+            const eventsCol = collection(db, 'honeypots', state.agentId, 'events')
+            const q = query(eventsCol, where('attackerIp','==', ip))
+            const snap = await getDocs(q)
+            const list = $('#profileList'); list.innerHTML=''
+            snap.forEach(d => {
+                const e = d.data()
+                const li = document.createElement('li')
+                li.className = 'p-1 text-sm border-b'
+                li.textContent = `${e.type} on ${e.targetPort} at ${new Date(e.timestamp?.seconds*1000||Date.now()).toLocaleString()}`
+                list.appendChild(li)
+            })
+            $('#profileTitle').textContent = `Activity for ${ip}`
+            $('#profileModal').classList.remove('hidden')
+        }
+
+        function unsubscribeAll() {
+            try { window.__zecx_unsubDoc?.() } catch(_){}
+            try { window.__zecx_unsubEventsFeed?.() } catch(_){}
+            try { window.__zecx_unsubEventsMap?.() } catch(_){}
+            try { window.__zecx_unsubTraffic?.() } catch(_){}
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            // Handle redirect result (if user came back from Google OAuth redirect)
+            getRedirectResult(auth).then((result) => {
+                // No-op: onAuthStateChanged will handle UI; this ensures errors surface in console
+                if (result?.user) {
+                    try { document.getElementById('authModal')?.classList.add('hidden') } catch(_){}
+                }
+            }).catch((e) => {
+                console.warn('Auth redirect error:', e)
+            })
+            // Theme toggle
+            const themeBtn = document.getElementById('themeToggle')
+            if (themeBtn) themeBtn.addEventListener('click', () => {
+                const root = document.documentElement
+                const dark = !root.classList.contains('dark')
+                if (dark) root.classList.add('dark'); else root.classList.remove('dark')
+                localStorage.setItem(LS_THEME_KEY, dark ? 'dark' : 'light')
+                themeBtn.textContent = dark ? '☀️ Light' : '🌙 Dark'
+            })
+            $('#pairBtn').addEventListener('click', () => {
+                const code = ($('#pairInput').value||'').trim()
+                pair(code)
+            })
+            $('#closeProfile').addEventListener('click', () => $('#profileModal').classList.add('hidden'))
+            // Tabs
+            const tabDevice = document.getElementById('tabDevice')
+            const tabAttackers = document.getElementById('tabAttackers')
+            const tabReports = document.getElementById('tabReports')
+            const viewDevice = document.getElementById('viewDevice')
+            const viewAttackers = document.getElementById('viewAttackers')
+            const viewReports = document.getElementById('viewReports')
+            function setTabActive(btn, active) {
+                const activeCls = ['bg-gradient-to-r','from-blue-600','to-indigo-600','text-white','shadow']
+                const inactiveCls = ['border','border-white/30','dark:border-white/10','bg-white/60','dark:bg-white/5','backdrop-blur','text-slate-700','dark:text-slate-200']
+                if (active) {
+                    btn.classList.add(...activeCls)
+                    btn.classList.remove(...inactiveCls)
+                } else {
+                    btn.classList.remove(...activeCls)
+                    btn.classList.add(...inactiveCls)
+                }
+            }
+            function invalidateMapSoon() {
+                try {
+                    if (!window.__zecx_map) return
+                    // Defer until after layout to let the container size settle
+                    requestAnimationFrame(() => setTimeout(() => {
+                        try { window.__zecx_map.invalidateSize({ animate: true }) } catch(_){}
+                    }, 50))
+                } catch(_){ }
+            }
+            function activate(tab) {
+                const isDevice = (tab === 'device')
+                const isAttackers = (tab === 'attackers')
+                const isReports = (tab === 'reports')
+                setTabActive(tabDevice, isDevice)
+                setTabActive(tabAttackers, isAttackers)
+                setTabActive(tabReports, isReports)
+                viewDevice.classList.toggle('hidden', !isDevice)
+                viewAttackers.classList.toggle('hidden', !isAttackers)
+                viewReports.classList.toggle('hidden', !isReports)
+                if (isAttackers) invalidateMapSoon()
+            }
+            tabDevice?.addEventListener('click', () => activate('device'))
+            tabAttackers?.addEventListener('click', () => activate('attackers'))
+            tabReports?.addEventListener('click', () => activate('reports'))
+            activate('device')
+            // Wire disconnect/sign-out
+            const dBtn = document.getElementById('disconnectAgentBtn')
+            const sBtn = document.getElementById('signOutBtn')
+            if (dBtn) dBtn.addEventListener('click', () => {
+                if (!confirm('Disconnect this browser from the linked agent?')) return
+                unsubscribeAll()
+                localStorage.removeItem(LS_KEY)
+                location.reload()
+            })
+            if (sBtn) sBtn.addEventListener('click', async () => {
+                if (!confirm('Sign out? This clears the agent link and Firebase config for this browser.')) return
+                try { await fbSignOut(auth) } catch(_){}
+                unsubscribeAll()
+                localStorage.removeItem(LS_KEY)
+                localStorage.removeItem(LS_CFG_KEY)
+                location.reload()
+            })
+            // Listener controls apply
+            const applyBtn = document.getElementById('applySettingsBtn')
+            if (applyBtn) applyBtn.addEventListener('click', applySettings)
+            // Reports
+            document.getElementById('genReportBtn')?.addEventListener('click', generateReport)
+            document.getElementById('downloadReportBtn')?.addEventListener('click', downloadReportPDF)
+            // Auth modal
+            document.getElementById('openAuthBtn')?.addEventListener('click', () => document.getElementById('authModal')?.classList.remove('hidden'))
+            document.getElementById('authClose')?.addEventListener('click', () => document.getElementById('authModal')?.classList.add('hidden'))
+            // Feed controls
+            const pauseBtn = document.getElementById('feedPauseBtn')
+            const clearBtn = document.getElementById('feedClearBtn')
+            if (pauseBtn) pauseBtn.addEventListener('click', ()=>{
+                state.feed = state.feed || { paused:false }
+                state.feed.paused = !state.feed.paused
+                pauseBtn.textContent = state.feed.paused ? 'Resume' : 'Pause'
+            })
+            if (clearBtn) clearBtn.addEventListener('click', ()=>{
+                const feed = document.getElementById('feed'); if (!feed) return
+                while (feed.firstChild) feed.removeChild(feed.firstChild)
+            })
+            // Reports actions
+            document.getElementById('genReportBtn')?.addEventListener('click', generateReport)
+            document.getElementById('downloadReportBtn')?.addEventListener('click', downloadReportPDF)
+            // Auth modal controls
+            document.getElementById('openAuthBtn')?.addEventListener('click', () => document.getElementById('authModal')?.classList.remove('hidden'))
+            document.getElementById('authClose')?.addEventListener('click', () => document.getElementById('authModal')?.classList.add('hidden'))
+            document.getElementById('authGoogle')?.addEventListener('click', async () => {
+                try {
+                    await signInWithPopup(auth, new GoogleAuthProvider());
+                    document.getElementById('authModal')?.classList.add('hidden')
+                } catch (e) {
+                    const code = e?.code || ''
+                    if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
+                        // Fallback to redirect in restricted environments
+                        try { await signInWithRedirect(auth, new GoogleAuthProvider()) } catch (er) { alert(er.message || String(er)) }
+                        return
+                    }
+                    if (code === 'auth/configuration-not-found') {
+                        alert('Google sign-in isn’t configured for this project. Enable Google provider in Firebase Console → Authentication → Sign-in method, and try again.')
+                        return
+                    }
+                    if (code === 'auth/unauthorized-domain') {
+                        alert('This domain is not authorized for OAuth. Add your domain (e.g., localhost) in Firebase Console → Authentication → Settings → Authorized domains.')
+                        return
+                    }
+                    alert(e.message || String(e))
+                }
+            })
+            document.getElementById('authEmailSignIn')?.addEventListener('click', async () => {
+                const email = (document.getElementById('authEmail')?.value||'').trim()
+                const pass = (document.getElementById('authPassword')?.value||'')
+                if (!email || !pass) return alert('Email and password required')
+                try { await signInWithEmailAndPassword(auth, email, pass); document.getElementById('authModal')?.classList.add('hidden') } catch(e){ alert(e.message||String(e)) }
+            })
+            document.getElementById('authEmailSignUp')?.addEventListener('click', async () => {
+                const email = (document.getElementById('authEmail')?.value||'').trim()
+                const pass = (document.getElementById('authPassword')?.value||'')
+                if (!email || !pass) return alert('Email and password required')
+                try { await createUserWithEmailAndPassword(auth, email, pass); document.getElementById('authModal')?.classList.add('hidden') } catch(e){ alert(e.message||String(e)) }
+            })
+            // Mark dirty on listener toggle/ports change
+            const sshT = document.getElementById('sshToggle')
+            const httpT = document.getElementById('httpToggle')
+            const sshP = document.getElementById('sshPort')
+            const httpP = document.getElementById('httpPort')
+            ;[sshT,httpT].forEach(el => el && el.addEventListener('change', ()=>setDirty(true)))
+            ;[sshP,httpP].forEach(el => el && el.addEventListener('input', ()=>setDirty(true)))
+            if (state.agentId) initDashboard(); else showPairing()
+            // Terminal controls
+            const fIp = document.getElementById('termFilterIp')
+            const aChk = document.getElementById('termAutoscroll')
+            const clr = document.getElementById('termClearBtn')
+            if (fIp) fIp.addEventListener('input', (e)=>{ state.terminal.filterIp = (e.target.value||'').trim(); renderTerminal() })
+            if (aChk) aChk.addEventListener('change', (e)=>{ state.terminal.autoscroll = !!e.target.checked })
+            if (clr) clr.addEventListener('click', ()=>{ state.terminal.lines = []; renderTerminal() })
+        })
+
+        function renderTerminal() {
+            const out = document.getElementById('terminalOutput')
+            const wrap = document.getElementById('terminalWindow')
+            if (!out || !wrap) return
+            const filter = (state.terminal.filterIp||'').toLowerCase()
+            const lines = state.terminal.lines.filter(l => !filter || (l.ip||'').toLowerCase().includes(filter))
+            const formatted = lines.map(l => `[${l.ts}] ${l.ip} $ ${l.cmd}`)
+            out.textContent = formatted.join('\n')
+            // autoscroll if enabled or if already near bottom
+            const nearBottom = (wrap.scrollTop + wrap.clientHeight) >= (wrap.scrollHeight - 24)
+            if (state.terminal.autoscroll || nearBottom) {
+                wrap.scrollTop = wrap.scrollHeight
+            }
+        }
+        </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* Subtle custom scrollbars */
+      * { scrollbar-width: thin; scrollbar-color: #64748b transparent; }
+      *::-webkit-scrollbar { height: 8px; width: 8px; }
+      *::-webkit-scrollbar-thumb { background-color: rgba(100,116,139,.6); border-radius: 9999px; }
+      *::-webkit-scrollbar-track { background-color: transparent; }
+      /* Terminal text selection */
+      #terminalOutput::selection { background: rgba(59,130,246,.35); }
+            /* Feed animations */
+            .feed-item { transition: all .18s ease-out; }
+    </style>
+</head>
+<body class="min-h-screen bg-slate-50 dark:bg-[#0b1020] text-slate-900 dark:text-slate-100">
+    <!-- Background ambience -->
+    <div class="pointer-events-none fixed inset-0 -z-10 overflow-hidden">
+        <div class="absolute -top-40 -left-40 w-[42rem] h-[42rem] rounded-full blur-3xl bg-gradient-to-br from-blue-500/20 via-indigo-500/10 to-transparent"></div>
+        <div class="absolute -bottom-64 -right-64 w-[58rem] h-[58rem] rounded-full blur-3xl bg-gradient-to-tr from-fuchsia-500/20 via-sky-500/10 to-transparent"></div>
+        <div class="absolute inset-0 opacity-70">
+            <div class="absolute inset-0 bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.06),transparent_55%)] dark:bg-[radial-gradient(ellipse_at_top,rgba(255,255,255,0.05),transparent_55%)]"></div>
+            <div class="absolute inset-0 bg-[linear-gradient(120deg,transparent_0%,transparent_35%,rgba(255,255,255,0.06)_50%,transparent_65%,transparent_100%)]"></div>
+        </div>
+    </div>
+    <!-- App Header -->
+    <header class="sticky top-0 z-30 border-b border-white/20 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur-2xl">
+        <div class="max-w-[90rem] mx-auto px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-500 text-white grid place-items-center font-bold shadow-lg shadow-blue-600/30">Z</div>
+                <div>
+                    <div class="font-semibold tracking-tight text-slate-900 dark:text-white">ZecX-Hpot</div>
+                    <div class="text-[11px] uppercase tracking-wider text-slate-500 dark:text-slate-400">Honeypot Monitoring</div>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <button id="themeToggle" class="px-3 py-1.5 rounded-lg border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur text-sm hover:bg-white/70 dark:hover:bg-white/10 transition">🌙 Dark</button>
+            </div>
+        </div>
+    </header>
+        <div id="cfgForm" class="hidden max-w-2xl mx-auto pt-8">
+            <h1 class="text-2xl font-semibold mb-3">Paste Firebase Web Config (JSON)</h1>
+            <p class="text-sm text-gray-600 mb-2">In Firebase Console → Project settings → General → Your apps (Web app) → Copy the config object and paste it here.</p>
+            <textarea id="cfgInput" class="w-full h-48 border rounded p-2 font-mono text-sm" placeholder='{"apiKey":"","authDomain":"","projectId":"","storageBucket":"","messagingSenderId":"","appId":""}'></textarea>
+            <button id="saveCfg" class="mt-3 bg-green-600 text-white px-4 py-2 rounded">Save Config</button>
+        </div>
+    <div id="pairing" class="max-w-md mx-auto pt-20 hidden">
+        <h1 class="text-3xl font-semibold mb-3 text-center">Link your Agent</h1>
+    <p class="text-center text-slate-600 dark:text-slate-300 mb-4">Paste the 12-character pairing code shown in your agent logs.</p>
+        <div class="p-4 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+          <input id="pairInput" class="border rounded-lg w-full px-3 py-2 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Enter code e.g. AB2D-EF3H-JK4M" />
+          <button id="pairBtn" class="mt-3 w-full px-4 py-2 rounded-lg text-white bg-gradient-to-r from-blue-600 to-indigo-600 shadow hover:shadow-lg transition">Link Agent</button>
+        </div>
+    </div>
+
+    <div id="dashboard" class="hidden p-4 max-w-[90rem] mx-auto">
+    <div class="flex items-center justify-between mb-5 flex-wrap gap-3">
+            <h1 class="text-3xl font-semibold tracking-tight">Dashboard</h1>
+            <div class="flex items-center gap-2 flex-wrap">
+                <span id="linkedAgentInfo" class="hidden text-sm text-slate-700 dark:text-slate-300 px-2 py-1 rounded-lg border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">Linked: <span id="linkedAgentUuid" class="font-mono"></span></span>
+                <span id="userBadge" class="hidden text-sm text-slate-700 dark:text-slate-300 px-2 py-1 rounded-lg border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur"></span>
+                <button id="openAuthBtn" class="px-3 py-1.5 rounded-lg text-white bg-blue-600/90 hover:bg-blue-600 shadow">Sign in</button>
+                <button id="disconnectAgentBtn" class="hidden px-3 py-1.5 rounded-lg text-white bg-amber-500/90 hover:bg-amber-500 shadow">Disconnect</button>
+                <button id="signOutBtn" class="hidden px-3 py-1.5 rounded-lg text-white bg-red-600/90 hover:bg-red-600 shadow">Sign out</button>
+            </div>
+        </div>
+        <div class="mb-5 flex items-center gap-2">
+            <button id="tabDevice" class="px-4 py-2 rounded-full text-sm font-medium bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow">Device</button>
+            <button id="tabAttackers" class="px-4 py-2 rounded-full text-sm font-medium border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur text-slate-700 dark:text-slate-200 hover:bg-white/70 dark:hover:bg-white/10">Attackers</button>
+            <button id="tabReports" class="px-4 py-2 rounded-full text-sm font-medium border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur text-slate-700 dark:text-slate-200 hover:bg-white/70 dark:hover:bg-white/10">Reports</button>
+        </div>
+
+        <div id="viewDevice" class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            <div class="lg:col-span-2 p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <h2 class="font-medium mb-2">System Info</h2>
+                <div class="space-y-1 text-sm">
+                    <div><span class="text-slate-600 dark:text-slate-400">Hostname:</span> <span id="hostname"></span></div>
+                    <div><span class="text-slate-600 dark:text-slate-400">IP:</span> <span id="ip"></span></div>
+                    <div><span class="text-slate-600 dark:text-slate-400">Public IP:</span> <span id="publicIp"></span></div>
+                    <div><span class="text-slate-600 dark:text-slate-400">MAC:</span> <span id="mac"></span></div>
+                    <div><span class="text-slate-600 dark:text-slate-400">OS:</span> <span id="os"></span></div>
+                </div>
+            </div>
+            <div class="lg:col-span-4 p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur h-full flex flex-col">
+                <h2 class="font-medium mb-2">Network Traffic</h2>
+                <div class="h-[200px] mt-auto"><canvas id="trafficChart" height="200"></canvas></div>
+            </div>
+            <div class="lg:col-span-6 p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="font-medium">Live Attack Feed</h2>
+                    <div class="flex items-center gap-2 text-xs">
+                        <button id="feedPauseBtn" class="px-2 py-1 rounded-lg border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 hover:bg-white/70 dark:hover:bg-white/10">Pause</button>
+                        <button id="feedClearBtn" class="px-2 py-1 rounded-lg border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 hover:bg-white/70 dark:hover:bg-white/10">Clear</button>
+                    </div>
+                </div>
+                <div class="grid grid-cols-12 text-[11px] uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">
+                    <div class="col-span-2">Time</div>
+                    <div class="col-span-4">Type</div>
+                    <div class="col-span-3">IP</div>
+                    <div class="col-span-1">Port</div>
+                    <div class="col-span-2 text-right">Severity</div>
+                </div>
+                <ul id="feed" class="max-h-48 overflow-auto divide-y divide-white/20 dark:divide-white/10"></ul>
+            </div>
+            <div class="lg:col-span-12 p-5 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <div class="flex items-center justify-between">
+                    <h2 class="font-medium">Attacker Terminal</h2>
+                    <div class="flex items-center gap-2 text-xs">
+                        <input id="termFilterIp" class="border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" placeholder="Filter by IP" />
+                        <label class="inline-flex items-center gap-1"><input id="termAutoscroll" type="checkbox" class="accent-blue-600" checked /> Autoscroll</label>
+                        <button id="termClearBtn" class="px-2 py-1 rounded-lg border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 hover:bg-white/70 dark:hover:bg-white/10">Clear</button>
+                    </div>
+                </div>
+                <div id="terminalWindow" class="mt-2 rounded-2xl border border-white/30 dark:border-white/10 overflow-hidden">
+                    <div class="px-3 py-2 bg-gradient-to-r from-slate-100 to-slate-200 dark:from-slate-900 dark:to-slate-800 border-b border-white/30 dark:border-white/10 flex items-center gap-2">
+                        <span class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+                        <span class="w-2.5 h-2.5 rounded-full bg-yellow-400"></span>
+                        <span class="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+                        <span class="ml-2 text-xs text-slate-600 dark:text-slate-400">live • commands</span>
+                    </div>
+                    <pre id="terminalOutput" class="h-72 overflow-auto bg-[#0b1020] text-[#d6deff] px-4 py-3 font-mono text-[12.5px] leading-relaxed whitespace-pre-wrap break-words"></pre>
+                </div>
+            </div>
+            <div class="lg:col-span-4 p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <h2 class="font-medium mb-3">Listener Controls</h2>
+                <div class="space-y-3 text-sm">
+                    <div class="flex items-center gap-2 text-xs mb-1">
+                        <span id="sshStatusBadge" class="px-2 py-0.5 rounded bg-white/60 dark:bg-white/10 border border-white/30 dark:border-white/10">SSH</span>
+                        <span id="httpStatusBadge" class="px-2 py-0.5 rounded bg-white/60 dark:bg-white/10 border border-white/30 dark:border-white/10">HTTP</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="font-medium">SSH Listener</div>
+                            <div class="text-slate-500">Expose SSH honeypot</div>
+                        </div>
+                        <label class="inline-flex items-center cursor-pointer">
+                            <input id="sshToggle" type="checkbox" class="sr-only peer">
+                            <div class="w-11 h-6 bg-gray-200/70 peer-focus:outline-none rounded-full peer dark:bg-gray-700 peer-checked:bg-blue-600 relative after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:h-5 after:w-5 after:rounded-full after:transition-all peer-checked:after:translate-x-full"></div>
+                        </label>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <div class="font-medium">HTTP Listener</div>
+                            <div class="text-slate-500">Expose fake admin panel</div>
+                        </div>
+                        <label class="inline-flex items-center cursor-pointer">
+                            <input id="httpToggle" type="checkbox" class="sr-only peer">
+                            <div class="w-11 h-6 bg-gray-200/70 peer-focus:outline-none rounded-full peer dark:bg-gray-700 peer-checked:bg-blue-600 relative after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:h-5 after:w-5 after:rounded-full after:transition-all peer-checked:after:translate-x-full"></div>
+                        </label>
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block text-xs text-slate-500 mb-1">SSH Port</label>
+                            <input id="sshPort" type="number" min="1" max="65535" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" placeholder="22" />
+                        </div>
+                        <div>
+                            <label class="block text-xs text-slate-500 mb-1">HTTP Port</label>
+                            <input id="httpPort" type="number" min="1" max="65535" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" placeholder="80" />
+                        </div>
+                    </div>
+                    <div class="text-xs text-slate-500">Note: Changing ports may require elevated privileges; the agent attempts to bind via capabilities set during install.</div>
+                    <button id="applySettingsBtn" class="mt-1 w-full rounded-lg text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:shadow-lg px-3 py-2 transition">Apply</button>
+                </div>
+            </div>
+            <div class="lg:col-span-8 p-3 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="font-medium">Additional Services</h2>
+                    <div class="flex items-center gap-2">
+                        <button id="svcAddBtn" class="px-3 py-1.5 rounded-lg text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:shadow">Add Service</button>
+                        <button id="svcSaveBtn" class="px-3 py-1.5 rounded-lg text-white bg-green-600/90 hover:bg-green-600 disabled:opacity-50">Saved</button>
+                    </div>
+                </div>
+                <div id="svcStatusList" class="mb-2 grid grid-cols-2 gap-1"></div>
+                <div class="grid grid-cols-12 text-xs font-medium text-slate-500 mb-1">
+                    <div class="col-span-2">Name</div>
+                    <div class="col-span-2">Kind</div>
+                    <div class="col-span-2">Port</div>
+                    <div class="col-span-5">Custom Banner</div>
+                    <div class="col-span-1 text-center">On</div>
+                </div>
+                <div id="servicesList" class="divide-y divide-white/20 dark:divide-white/10 max-h-56 overflow-auto"></div>
+                <p class="mt-2 text-xs text-slate-500">Tip: Avoid opening too many common ports. Mix a few realistic services to look like a real device.</p>
+            </div>
+        </div>
+        <div id="viewAttackers" class="hidden space-y-4">
+            <div class="p-4 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <h2 class="font-medium mb-2">Attackers World Map</h2>
+                <div id="map" style="height: 420px"></div>
+            </div>
+            <div class="p-4 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <h2 class="font-medium mb-2">Attacker Activity</h2>
+                <ul id="attackerList" class="max-h-80 overflow-auto divide-y divide-white/20 dark:divide-white/10"></ul>
+            </div>
+        </div>
+
+        <div id="viewReports" class="hidden space-y-4">
+            <div class="p-4 rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur">
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="font-medium">Automated Reports</h2>
+                    <div class="flex items-center gap-2 text-xs">
+                        <button id="genReportBtn" class="px-3 py-1.5 rounded-lg text-white bg-gradient-to-r from-blue-600 to-indigo-600">Generate</button>
+                        <button id="downloadReportBtn" class="px-3 py-1.5 rounded-lg text-white bg-green-600">Download PDF</button>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3">
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">From</label>
+                        <input id="reportFrom" type="datetime-local" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" />
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">To</label>
+                        <input id="reportTo" type="datetime-local" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" />
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">Severity</label>
+                        <select id="reportSeverity" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700">
+                            <option>Any</option>
+                            <option>Critical</option>
+                            <option>High</option>
+                            <option>Medium</option>
+                            <option>Low</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="reportSummary" class="mb-3"></div>
+                <div id="reportTableWrap" class="overflow-auto max-h-96 border border-white/20 rounded">
+                    <table class="w-full text-left text-slate-800 dark:text-slate-200 text-xs">
+                        <thead class="bg-white/60 dark:bg-white/10">
+                            <tr>
+                                <th class="px-2 py-1">Time</th>
+                                <th class="px-2 py-1">Type</th>
+                                <th class="px-2 py-1">IP</th>
+                                <th class="px-2 py-1">Port</th>
+                                <th class="px-2 py-1">Severity</th>
+                            </tr>
+                        </thead>
+                        <tbody id="reportTable"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="profileModal" class="hidden fixed inset-0 bg-black/40 flex items-center justify-center">
+        <div class="rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur p-4 w-[28rem]">
+            <div class="flex justify-between items-center mb-2">
+                <h3 id="profileTitle" class="font-semibold">Attacker Profile</h3>
+                <button id="closeProfile" class="text-gray-600">✕</button>
+            </div>
+            <ul id="profileList" class="max-h-80 overflow-auto divide-y"></ul>
+        </div>
+    </div>
+    <!-- Auth Modal -->
+    <div id="authModal" class="hidden fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+        <div class="rounded-2xl border border-white/30 dark:border-white/10 bg-white/60 dark:bg-white/5 backdrop-blur p-4 w-[26rem]">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="font-semibold">Sign in</h3>
+                <button id="authClose" class="text-gray-600">✕</button>
+            </div>
+            <div class="space-y-2">
+                <button id="authGoogle" class="w-full px-3 py-2 rounded-lg text-white bg-red-600/90 hover:bg-red-600">Continue with Google</button>
+                <div class="grid grid-cols-1 gap-2">
+                    <input id="authEmail" type="email" placeholder="Email" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" />
+                    <input id="authPassword" type="password" placeholder="Password" class="w-full border rounded px-2 py-1 bg-white/80 dark:bg-slate-900/50 border-slate-300 dark:border-slate-700" />
+                </div>
+                <div class="flex items-center gap-2">
+                    <button id="authEmailSignIn" class="px-3 py-1.5 rounded-lg text-white bg-blue-600/90 hover:bg-blue-600">Sign in</button>
+                    <button id="authEmailSignUp" class="px-3 py-1.5 rounded-lg text-white bg-indigo-600/90 hover:bg-indigo-600">Sign up</button>
+                </div>
+                <p class="text-xs text-slate-500">We’ll associate this browser’s paired agent to your account when you link with a pairing code.</p>
+            </div>
+        </div>
+    </div>
+    <script type="module">
+        import { getAuth, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.14.0/firebase-auth.js'
+        const auth2 = getAuth()
+        onAuthStateChanged(auth2, (user) => {
+            const badge = document.getElementById('userBadge')
+            const openBtn = document.getElementById('openAuthBtn')
+            const signOutBtn = document.getElementById('signOutBtn')
+            if (user) {
+                if (badge) { badge.textContent = user.email || user.uid; badge.classList.remove('hidden') }
+                openBtn?.classList.add('hidden')
+                signOutBtn?.classList.remove('hidden')
+            } else {
+                badge?.classList.add('hidden')
+                badge && (badge.textContent = '')
+                openBtn?.classList.remove('hidden')
+                signOutBtn?.classList.add('hidden')
+            }
+        })
+    </script>
+</body>
+</html>
