@@ -1,0 +1,25 @@
+.ingest.env
+# Sensitive credentials (NEVER commit real keys)
+serviceAccountKey.json
+agent/serviceAccountKey.json
+**/serviceAccountKey*.json
+
+# Local agent state
+/etc/zecx-hpot/
+**/pairing_code_*.txt
+*.pairing_code
+
+# Binaries and build outputs
+agent/network-dispatcher
+agent/zecx-unpair
+agent/sshsmoke
+**/*.exe
+**/*.out
+**/*.bin
+
+# Logs and misc
+*.log
+.DS_Store
+*.swp
+.vscode/
+.idea/

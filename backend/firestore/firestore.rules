@@ -1,0 +1,64 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow anyone to create and read honeypot docs
+    match /honeypots/{agentId} {
+      allow read: if true; // optionally lock to owner: resource.data.ownerUid == request.auth.uid
+      allow create: if true;
+      // Allow pairing transition OR settings update. Other top-level fields remain protected.
+      allow update: if (
+        // Pairing (requires auth): set ownerUid, set isPaired true, null the pairingCode, and ensure code not expired
+        (
+          request.auth != null &&
+          resource.data.isPaired == false &&
+          resource.data.pairingCode != null &&
+          resource.data.pairingExpiresAt != null &&
+          resource.data.pairingExpiresAt > request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isPaired','pairingCode','ownerUid']) &&
+          request.resource.data.isPaired == true &&
+          request.resource.data.pairingCode == null &&
+          request.resource.data.ownerUid == request.auth.uid
+        ) ||
+        // Pairing: only allow setting isPaired true and nulling pairingCode
+        false ||
+        // Settings: allow replacing settings object with expected keys (including optional services list)
+        (
+          request.auth != null &&
+          // Only the owner can update settings
+          ('ownerUid' in resource.data) && resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(['settings']) &&
+          request.resource.data.settings is map &&
+          // Only permit known keys in settings
+          request.resource.data.settings.keys().hasOnly(['enableSSH','enableHTTP','sshPort','httpPort','services']) &&
+          // Required fields and types
+          ('enableSSH' in request.resource.data.settings) && (request.resource.data.settings.enableSSH is bool) &&
+          ('enableHTTP' in request.resource.data.settings) && (request.resource.data.settings.enableHTTP is bool) &&
+          ('sshPort'    in request.resource.data.settings) && (request.resource.data.settings.sshPort is int) &&
+          ('httpPort'   in request.resource.data.settings) && (request.resource.data.settings.httpPort is int) &&
+          request.resource.data.settings.sshPort >= 1 && request.resource.data.settings.sshPort <= 65535 &&
+          request.resource.data.settings.httpPort >= 1 && request.resource.data.settings.httpPort <= 65535 &&
+          // services optional; if present, only ensure it's a list within sane bounds
+          (
+            !('services' in request.resource.data.settings) || (
+              request.resource.data.settings.services is list &&
+              request.resource.data.settings.services.size() <= 20
+            )
+          )
+        )
+      );
+      allow delete: if false;
+
+      match /events/{eventId} {
+        allow read: if true;
+        allow create: if true;
+        allow update, delete: if false;
+      }
+
+      match /traffic/{tId} {
+        allow read: if true;
+        allow create: if true;
+        allow update, delete: if false;
+      }
+    }
+  }
+}
